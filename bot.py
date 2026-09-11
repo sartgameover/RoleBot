@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import json
 import os
+from aiohttp import web
 
 # --- БАЗА ДАННЫХ (ФАЙЛ) ---
 DB_FILE = "bot_db.json"
@@ -20,21 +21,32 @@ def save_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
+# --- ВЕБ-СЕРВЕР ДЛЯ ДЕРЖАНИЯ БОТА 24/7 НА RENDER ($0 PLAN) ---
+async def handle_ping(request):
+    return web.Response(text="Bot is running 24/7!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Веб-сервер запущен на порту {port}")
+
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ СЕССИЙ КОНСТРУКТОРА ---
-# Хранит временные данные конструктора для каждого пользователя
 builder_sessions = {}
 
 # --- ПРОВЕРКА ПРАВ ДОСТУПА ---
 def is_config_admin():
     async def predicate(interaction: discord.Interaction):
-        # Администраторы сервера всегда имеют доступ
         if interaction.user.guild_permissions.administrator:
             return True
         
         db = load_db()
         user_role_ids = [role.id for role in interaction.user.roles]
         
-        # Проверяем, есть ли у пользователя разрешенная роль
         if any(role_id in db.get("admin_roles", []) for role_id in user_role_ids):
             return True
         
@@ -51,10 +63,8 @@ class RoleDropdown(discord.ui.Select):
         member_role_ids = [r.id for r in member.roles]
         
         for badge in roles_data:
-            # Если у пользователя уже есть эта роль, делаем её выбранной по умолчанию (default=True)
             has_role = badge['role_id'] in member_role_ids
             emoji = badge.get('emoji')
-            # discord.py требует None, если эмодзи пустая строка
             emoji_obj = discord.PartialEmoji.from_str(emoji) if emoji and emoji.strip() else None
             
             options.append(discord.SelectOption(
@@ -66,8 +76,8 @@ class RoleDropdown(discord.ui.Select):
         
         super().__init__(
             placeholder="Выберите роли...",
-            min_values=0, # 0 позволяет снять с себя все роли
-            max_values=len(options), # Можно выбрать сколько угодно из доступных
+            min_values=0,
+            max_values=len(options),
             options=options
         )
 
@@ -117,7 +127,7 @@ class EphemeralRolePanelView(discord.ui.View):
 # --- UI: ПОСТОЯННАЯ КНОПКА ПОД ОПУБЛИКОВАННЫМ СООБЩЕНИЕМ ---
 class GetRolesPersistentView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None) # timeout=None делает кнопку вечной
+        super().__init__(timeout=None)
 
     @discord.ui.button(label="Получить роли", style=discord.ButtonStyle.primary, custom_id="persistent_get_roles_button")
     async def get_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -134,7 +144,6 @@ class GetRolesPersistentView(discord.ui.View):
             await interaction.response.send_message("В этом сообщении пока нет настроенных ролей.", ephemeral=True)
             return
             
-        # Отправляем ЭФЕМЕРНОЕ сообщение с Select Menu
         view = EphemeralRolePanelView(roles_data, interaction.user)
         await interaction.response.send_message("Выберите желаемые роли ниже:", view=view, ephemeral=True)
 
@@ -164,7 +173,6 @@ class BadgeSetupModal(discord.ui.Modal, title='Настройка плашки')
             await interaction.response.send_message("Сессия истекла.", ephemeral=True)
             return
             
-        # Добавляем плашку в сессию (Discord API лимит: макс 25 элементов в меню)
         if len(builder_sessions[user_id]['roles']) >= 25:
             await interaction.response.send_message("❌ Достигнут лимит Discord: максимум 25 ролей в одном меню.", ephemeral=True)
             return
@@ -176,7 +184,6 @@ class BadgeSetupModal(discord.ui.Modal, title='Настройка плашки')
             "emoji": self.badge_emoji.value
         })
         
-        # Обновляем отображение конструктора
         await update_builder_message(interaction, user_id)
 
 class BuilderRoleSelect(discord.ui.RoleSelect):
@@ -185,12 +192,10 @@ class BuilderRoleSelect(discord.ui.RoleSelect):
 
     async def callback(self, interaction: discord.Interaction):
         role = self.values[0]
-        # При выборе роли открываем модальное окно для ввода названия и эмодзи
         await interaction.response.send_modal(BadgeSetupModal(role))
 
 class BuilderChannelSelect(discord.ui.ChannelSelect):
     def __init__(self):
-        # Ограничиваем выбор только текстовыми каналами
         super().__init__(placeholder="📍 Выберите канал для отправки...", channel_types=[discord.ChannelType.text], min_values=1, max_values=1, row=1)
 
     async def callback(self, interaction: discord.Interaction):
@@ -222,7 +227,6 @@ class BuilderView(discord.ui.View):
             await interaction.response.send_message("❌ Добавьте хотя бы одну плашку (роль)!", ephemeral=True)
             return
 
-        # Отправляем итоговое сообщение в выбранный канал
         view = GetRolesPersistentView()
         try:
             sent_msg = await channel.send(content=session['text'], view=view)
@@ -230,7 +234,6 @@ class BuilderView(discord.ui.View):
             await interaction.response.send_message("❌ У бота нет прав писать в этот канал.", ephemeral=True)
             return
 
-        # Сохраняем в БД
         db = load_db()
         if "messages" not in db:
             db["messages"] = {}
@@ -240,7 +243,6 @@ class BuilderView(discord.ui.View):
         }
         save_db(db)
 
-        # Очищаем сессию
         del builder_sessions[self.user_id]
         
         await interaction.response.edit_message(content=f"✅ Сообщение успешно опубликовано в {channel.mention}!", view=None)
@@ -248,7 +250,6 @@ class BuilderView(discord.ui.View):
 async def update_builder_message(interaction: discord.Interaction, user_id: int):
     session = builder_sessions[user_id]
     
-    # Формируем текст панели администратора
     text = f"**Текст сообщения:**\n{session['text']}\n\n"
     text += "**Добавленные плашки:**\n"
     
@@ -264,7 +265,6 @@ async def update_builder_message(interaction: discord.Interaction, user_id: int)
 
     view = BuilderView(user_id)
     
-    # Если interaction еще не отвечен, отвечаем. Иначе редактируем.
     if interaction.response.is_done():
         await interaction.edit_original_response(content=text, view=view)
     else:
@@ -281,14 +281,12 @@ class MainTextModal(discord.ui.Modal, title='Создание сообщения
 
     async def on_submit(self, interaction: discord.Interaction):
         user_id = interaction.user.id
-        # Инициализируем сессию для пользователя
         builder_sessions[user_id] = {
             "text": self.main_text.value,
             "roles": [],
             "channel": None
         }
         
-        # Запускаем интерфейс конструктора
         session = builder_sessions[user_id]
         text = f"**Текст сообщения:**\n{session['text']}\n\n**Добавленные плашки:**\n— Пока нет плашек —\n\n**Канал отправки:** Не выбран"
         
@@ -300,15 +298,17 @@ class MainTextModal(discord.ui.Modal, title='Создание сообщения
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.members = True # Обязательно для выдачи ролей
+        intents.members = True
         intents.message_content = True
         
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Регистрируем persistent view, чтобы кнопки работали после перезапуска бота
+        # Запускаем фоновый веб-сервер для Render
+        self.loop.create_task(start_web_server())
+        
         self.add_view(GetRolesPersistentView())
-        await self.tree.sync() # Синхронизируем Slash-команды
+        await self.tree.sync()
         print("Бот готов и слэш-команды синхронизированы!")
 
 bot = MyBot()
@@ -321,7 +321,7 @@ config_group = ConfigGroup(name="config", description="Настройка сис
 
 @config_group.command(name="role", description="Разрешить или запретить роли настраивать бота")
 @app_commands.describe(target_role="Роль, которой вы хотите выдать/забрать доступ")
-@app_commands.checks.has_permissions(administrator=True) # Только админы могут настраивать доступ
+@app_commands.checks.has_permissions(administrator=True)
 async def config_role(interaction: discord.Interaction, target_role: discord.Role):
     db = load_db()
     if target_role.id in db["admin_roles"]:
@@ -337,7 +337,6 @@ async def config_role(interaction: discord.Interaction, target_role: discord.Rol
 @config_group.command(name="create", description="Создать новое сообщение с выдачей ролей")
 @is_config_admin()
 async def config_create(interaction: discord.Interaction):
-    # Открываем модальное окно для ввода главного текста
     await interaction.response.send_modal(MainTextModal())
 
 bot.tree.add_command(config_group)
@@ -345,7 +344,6 @@ bot.tree.add_command(config_group)
 
 # --- ЗАПУСК БОТА ---
 if __name__ == "__main__":
-    # Получаем токен из переменных окружения (безопасно для GitHub)
     TOKEN = os.getenv("DISCORD_TOKEN")
     
     if not TOKEN:
